@@ -44,9 +44,27 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
+####удалить после проверки
+from aiogram.filters import Command
+import logging
+
 @dp.message(Command("ping"))
 async def ping(m: Message):
-    await m.answer("pong")
+    logging.info("PING from %s", m.from_user.id)
+    try:
+        await m.answer("pong")
+    except Exception as e:
+        logging.exception("TG m.answer error: %s", e)
+
+# временный отладочный ловец всего текста
+@dp.message(F.text)
+async def debug_catch_all(m: Message):
+    logging.info("TEXT from %s: %r", m.from_user.id, m.text)
+    try:
+        await m.answer("debug ok")
+    except Exception as e:
+        logging.exception("TG send error: %s", e)
+####
 
 # ========= Память «ожидаемого ввода» для редактирования профиля =========
 # user_id -> "name" | "age" | "interests"
