@@ -1,7 +1,7 @@
 import os
 from fastapi import FastAPI, Request
 from aiogram.types import Update
-
+import logging
 # импортируй свои объекты из текущего main.py (ничего в нём менять не нужно)
 from main import bot, dp, init_db
 
@@ -9,11 +9,15 @@ app = FastAPI()
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "supersecret")
 PUBLIC_URL = os.getenv("PUBLIC_URL")  # Render URL, добавишь в переменные
 
+
 @app.on_event("startup")
 async def on_startup():
     await init_db()
+    me = await bot.get_me()
+    logging.info("Running as @%s (id=%s)", me.username, me.id)
     if PUBLIC_URL:
         await bot.set_webhook(f"{PUBLIC_URL}/webhook/{WEBHOOK_SECRET}")
+
 
 @app.post("/webhook/{secret}")
 async def telegram_webhook(secret: str, request: Request):
