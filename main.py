@@ -16,7 +16,6 @@ from aiogram.types import (
     LabeledPrice,
 )
 from aiogram.filters import CommandStart, Command
-from aiogram.filters import Command
 
 # ========= ENV =========
 load_dotenv()
@@ -44,25 +43,9 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-####удалить после проверки     
-from aiogram.types import Message
-
 @dp.message(Command("ping"))
 async def ping(m: Message):
-    logging.info("PING from user=%s chat=%s", m.from_user.id, m.chat.id)
-    try:
-        await m.answer("pong")
-    except Exception as e:
-        logging.exception("TG m.answer error: %s", e)
-
-@dp.message(F.text)
-async def debug_text(m: Message):
-    logging.info("TEXT from user=%s chat=%s: %r", m.from_user.id, m.chat.id, m.text)
-    try:
-        await m.answer("debug ok")
-    except Exception as e:
-        logging.exception("TG send error: %s", e)
-####
+    await m.answer("pong")
 
 # ========= Память «ожидаемого ввода» для редактирования профиля =========
 # user_id -> "name" | "age" | "interests"
