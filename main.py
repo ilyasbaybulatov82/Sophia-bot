@@ -44,22 +44,20 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
 
-####удалить после проверки
-from aiogram.filters import Command
-import logging
+####удалить после проверки     
+from aiogram.types import Message
 
 @dp.message(Command("ping"))
 async def ping(m: Message):
-    logging.info("PING from %s", m.from_user.id)
+    logging.info("PING from user=%s chat=%s", m.from_user.id, m.chat.id)
     try:
         await m.answer("pong")
     except Exception as e:
         logging.exception("TG m.answer error: %s", e)
 
-# временный отладочный ловец всего текста
 @dp.message(F.text)
-async def debug_catch_all(m: Message):
-    logging.info("TEXT from %s: %r", m.from_user.id, m.text)
+async def debug_text(m: Message):
+    logging.info("TEXT from user=%s chat=%s: %r", m.from_user.id, m.chat.id, m.text)
     try:
         await m.answer("debug ok")
     except Exception as e:
