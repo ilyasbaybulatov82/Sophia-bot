@@ -18,10 +18,6 @@ from aiogram.types import (
 from aiogram.filters import CommandStart, Command
 from aiogram.filters import Command
 
-@dp.message(Command("ping"))
-async def ping(m: Message):
-    await m.answer("pong")
-
 # ========= ENV =========
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
@@ -47,6 +43,10 @@ HISTORY_MAX_TURNS = int(os.getenv("HISTORY_MAX_TURNS", "8"))
 logging.basicConfig(level=logging.INFO)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+
+@dp.message(Command("ping"))
+async def ping(m: Message):
+    await m.answer("pong")
 
 # ========= Память «ожидаемого ввода» для редактирования профиля =========
 # user_id -> "name" | "age" | "interests"
