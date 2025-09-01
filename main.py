@@ -16,6 +16,11 @@ from aiogram.types import (
     LabeledPrice,
 )
 from aiogram.filters import CommandStart, Command
+from aiogram.filters import Command
+
+@dp.message(Command("ping"))
+async def ping(m: Message):
+    await m.answer("pong")
 
 # ========= ENV =========
 load_dotenv()
