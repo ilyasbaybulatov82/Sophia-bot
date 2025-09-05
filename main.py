@@ -4,7 +4,8 @@ import asyncio
 import logging
 import httpx
 import aiosqlite
-from datetime import datetime, timedelta
+import time
+from datetime import datetime, timedelta, timezone
 from dotenv import load_dotenv
 from typing import Dict, Optional
 
@@ -13,18 +14,20 @@ from aiogram.types import (
     Message, CallbackQuery, PreCheckoutQuery,
     InlineKeyboardMarkup, InlineKeyboardButton,
     ReplyKeyboardMarkup, KeyboardButton,
-    LabeledPrice,
+    LabeledPrice, FSInputFile,
 )
 from aiogram.filters import CommandStart, Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import StatesGroup, State
+import csv, tempfile
 
 # ========= ENV =========
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY")
 DEEPSEEK_MODEL = os.getenv("DEEPSEEK_MODEL", "deepseek-chat")
-
-DAILY_FREE_LIMIT = int(os.getenv("DAILY_FREE_LIMIT", "3"))
 DB_PATH = os.getenv("DB_PATH", "bot.db")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0"))  # переменная в Render уже добавлена
 
 # Бесплатный период (дней) — для отображения и расчёта «сколько осталось»
 FREE_TRIAL_DAYS = int(os.getenv("FREE_TRIAL_DAYS", "7"))
@@ -37,11 +40,16 @@ PREMIUM_DAYS_MONTH = int(os.getenv("PREMIUM_DAYS_MONTH", "30"))
 PREMIUM_DAYS_WEEK  = int(os.getenv("PREMIUM_DAYS_WEEK", "7"))
 
 # Контекст диалога — сколько последних пар реплик подмешивать
-HISTORY_MAX_TURNS = int(os.getenv("HISTORY_MAX_TURNS", "8"))
+HISTORY_MAX_TURNS = int(os.getenv("HISTORY_MAX_TURNS", "15"))
 
 logging.basicConfig(level=logging.INFO)
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher()
+
+class Feedback(StatesGroup):
+    waiting_kind = State()  # выбор: отзыв или жалоба
+    waiting_text = State()  # ожидание текста
+
 
 @dp.message(Command("ping"))
 async def ping(m: Message):
@@ -117,6 +125,13 @@ Always reply only in the language the user writes in. Mirror the user’s langua
 Remember: your purpose is to be a supportive, natural, empathetic friend who makes the user feel understood and a bit stronger.
 """
 
+# ========= Утлиты времени =========
+def now_ts() -> int:
+    return int(time.time())
+
+def iso_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
 # ========= HELPERS =========
 def profile_to_text(p: dict | None) -> str:
     if not p:
@@ -137,6 +152,7 @@ def main_menu():
         keyboard=[
             [KeyboardButton(text="💜 Профиль"), KeyboardButton(text="💎 Подписка")],
             [KeyboardButton(text="📝 Изменить данные")],
+            [KeyboardButton(text="📝 Обратная связь")],  # ← добавили
             [KeyboardButton(text="🔄 Сбросить диалог"), KeyboardButton(text="❌ Забыть всё")],
         ],
         resize_keyboard=True
@@ -154,17 +170,115 @@ def subscription_choose_plan():
         [InlineKeyboardButton(text="Неделя — 300 ₽", callback_data="sub_buy_week")],
     ])
 
+async def ensure_user_exists(user_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO users(user_id, created_at) VALUES (?, ?)",
+            (user_id, iso_now())
+        )
+        await db.commit()
+
+async def set_premium_until_ts(user_id: int, until_ts: int, plan: str | None):
+    # храним как epoch-в-строке — твой get_premium_until_ts это понимает
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+            INSERT INTO premium(user_id, premium_until, plan)
+            VALUES (?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET premium_until=?, plan=?
+        """, (user_id, str(until_ts), plan, str(until_ts), plan))
+        await db.commit()
+
+async def grant_premium_days(user_id: int, days: int, plan: str):
+    now = now_ts()
+    current = await get_premium_until_ts(user_id)  # 0 если нет
+    base = max(now, current)                       # продлеваем от большего
+    until = base + days * 86400
+    await set_premium_until_ts(user_id, until, plan)
+    return until
+
+
+async def ensure_trial(user_id: int):
+    await ensure_user_exists(user_id)
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT trial_start_ts, trial_end_ts FROM users WHERE user_id=?",
+            (user_id,)
+        )
+        row = await cur.fetchone()
+        start_ts, end_ts = (row or (None, None))
+        if start_ts is None or end_ts is None:
+            start = now_ts()
+            end = start + FREE_TRIAL_DAYS * 86400
+            await db.execute(
+                "UPDATE users SET trial_start_ts=?, trial_end_ts=? WHERE user_id=?",
+                (start, end, user_id)
+            )
+            await db.commit()
+
+async def get_premium_until_ts(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT premium_until FROM premium WHERE user_id=?",
+            (user_id,)
+        )
+        row = await cur.fetchone()
+
+    if not row or not row[0]:
+        return 0
+
+    val = str(row[0]).strip()
+    # если пришло число в строке — трактуем как epoch
+    if val.isdigit():
+        try:
+            return int(val)
+        except Exception:
+            return 0
+
+    # иначе пытаемся распарсить ISO-дату
+    try:
+        # поддержка возможного суффикса 'Z'
+        if val.endswith("Z"):
+            val = val.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(val)
+        return int(dt.timestamp())
+    except Exception:
+        return 0
+
+async def is_access_allowed(user_id: int) -> bool:
+    now = now_ts()
+    # trial_end_ts из users
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COALESCE(trial_end_ts, 0) FROM users WHERE user_id=?",
+            (user_id,)
+        )
+        row = await cur.fetchone()
+    trial_end = int(row[0]) if row and row[0] else 0
+
+    premium_until = await get_premium_until_ts(user_id)
+
+    return now <= max(trial_end, premium_until)
+
+def days_left(from_ts: int, to_ts: int) -> int:
+    if to_ts <= from_ts:
+        return 0
+    # округляем вверх: 1.2 дня → 2
+    return (to_ts - from_ts + 86399) // 86400
+
 # ========= DB =========
 async def init_db():
     async with aiosqlite.connect(DB_PATH) as db:
-        # пользователи (для даты первого визита — free trial)
+        # пользователи (добавили колонки trial_* для бесплатной недели)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                trial_start_ts INTEGER,   -- unix-ts начала триала
+                trial_end_ts   INTEGER    -- unix-ts конца триала
             )
         """)
-        # лимиты
+
+        # лимиты (останутся, но использовать не будем — на будущее/совместимость)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS usage (
                 user_id INTEGER NOT NULL,
@@ -173,7 +287,8 @@ async def init_db():
                 PRIMARY KEY (user_id, day)
             )
         """)
-        # премиум (+ план)
+
+        # премиум (+ план) — как было (premium_until хранится TEXT, не трогаем)
         await db.execute("""
             CREATE TABLE IF NOT EXISTS premium (
                 user_id INTEGER PRIMARY KEY,
@@ -181,7 +296,8 @@ async def init_db():
                 plan TEXT
             )
         """)
-        # профиль
+
+        # профиль — без изменений
         await db.execute("""
             CREATE TABLE IF NOT EXISTS profile (
                 user_id INTEGER PRIMARY KEY,
@@ -192,7 +308,8 @@ async def init_db():
                 updated_at TEXT
             )
         """)
-        # история диалога
+
+        # история диалога — без изменений
         await db.execute("""
             CREATE TABLE IF NOT EXISTS dialog (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -202,9 +319,36 @@ async def init_db():
                 ts TEXT NOT NULL
             )
         """)
-        # на случай старой схемы без планов — добавим колонку план, если нет
+
+        # новая таблица: обратная связь (отзывы/жалобы)
+        await db.execute("""
+            CREATE TABLE IF NOT EXISTS feedback (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                kind TEXT NOT NULL,      -- 'review' | 'complaint'
+                text TEXT NOT NULL,
+                created_at INTEGER NOT NULL
+            )
+        """)
+
+        # на случай старых БД — мягко добавим недостающие колонки
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN trial_start_ts INTEGER")
+        except Exception:
+            pass
+        try:
+            await db.execute("ALTER TABLE users ADD COLUMN trial_end_ts INTEGER")
+        except Exception:
+            pass
         try:
             await db.execute("ALTER TABLE premium ADD COLUMN plan TEXT")
+        except Exception:
+            pass
+
+        # полезные индексы (опционально, но ускорят выборки)
+        try:
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_feedback_user ON feedback(user_id)")
+            await db.execute("CREATE INDEX IF NOT EXISTS idx_feedback_created ON feedback(created_at)")
         except Exception:
             pass
 
@@ -390,10 +534,36 @@ def buy_keyboard() -> InlineKeyboardMarkup:
 # ========= COMMANDS & MENU =========
 @dp.message(CommandStart())
 async def start(m: Message):
-    await ensure_user(m.from_user.id)
+    # 1) запускаем триал при первом контакте
+    await ensure_trial(m.from_user.id)
 
-    premium = await has_premium(m.from_user.id)
-    status = "Безлимит активен 💎" if premium else f"Бесплатно: {DAILY_FREE_LIMIT} сообщений/день"
+    # 2) считаем статус (премиум / триал)
+    user_id = m.from_user.id
+    now = now_ts()
+
+    # trial_end_ts из users
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COALESCE(trial_end_ts,0) FROM users WHERE user_id=?",
+            (user_id,)
+        )
+        row = await cur.fetchone()
+    trial_end = int(row[0]) if row and row[0] else 0
+
+    # premium_until (переводим TEXT → ts)
+    premium_until = await get_premium_until_ts(user_id)
+
+    # 3) формируем строку статуса
+    if now <= premium_until:
+        until_str = datetime.fromtimestamp(premium_until).strftime("%d.%m.%Y")
+        status = f"Безлимит активен 💎 до {until_str}"
+    elif now <= trial_end:
+        left = days_left(now, trial_end)
+        status = f"Бесплатный период: осталось {left} дн."
+    else:
+        status = "Доступ приостановлен. Нажми «💎 Подписка», чтобы продолжить."
+
+    # 4) приветствие (как у тебя было)
     p = await get_profile(m.from_user.id)
     name = p.get("name") if p else None
     hello = f"Привет, {name}! 💜" if name else "Привет! 💜"
@@ -402,14 +572,6 @@ async def start(m: Message):
         f"{hello}\n{status}\n\n"
         "Я — Sophia, твоя виртуальная подруга.\n"
         "Можешь просто написать мне или выбрать действие в меню ниже 👇",
-        reply_markup=main_menu()
-    )
-
-@dp.message(Command("help"))
-async def help_cmd(m: Message):
-    await m.answer(
-        "Команды: /profile /reset /forget\n"
-        "Но удобнее пользоваться меню под строкой ввода 😊",
         reply_markup=main_menu()
     )
 
@@ -438,6 +600,29 @@ async def cmd_forget(m: Message):
     await forget_user(m.from_user.id)
     await m.answer("Я всё забыла: профиль, историю и лимиты. Можем начать заново.", reply_markup=main_menu())
 
+@dp.message(Command("export_feedback"))
+async def export_feedback(m: Message):
+    # только админ
+    if m.from_user.id != ADMIN_ID:
+        return
+
+    rows = []
+    async with aiosqlite.connect(DB_PATH) as db:
+        async with db.execute(
+            "SELECT id, user_id, kind, text, created_at FROM feedback ORDER BY id DESC LIMIT 1000"
+        ) as cur:
+            async for r in cur:
+                rows.append(r)
+
+    # пишем во временный CSV и отправляем
+    with tempfile.NamedTemporaryFile("w", newline="", delete=False, suffix=".csv") as f:
+        writer = csv.writer(f)
+        writer.writerow(["id", "user_id", "kind", "text", "created_at"])
+        writer.writerows(rows)
+        path = f.name
+
+    await m.answer_document(FSInputFile(path), caption="Отзывы/жалобы (CSV)")
+
 # ========= MENU (ReplyKeyboard) =========
 @dp.message(F.text == "💜 Профиль")
 async def menu_profile(m: Message):
@@ -456,33 +641,50 @@ async def menu_edit(m: Message):
 
 @dp.message(F.text == "💎 Подписка")
 async def menu_subscription(m: Message):
-    await ensure_user(m.from_user.id)
+    user_id = m.from_user.id
 
-    # Статус премиума
-    info = await get_premium_info(m.from_user.id)
-    if info and info["until"] > datetime.now():
-        plan = "Месячная" if (info["plan"] or "").lower() == "month" else "Недельная" if (info["plan"] or "").lower() == "week" else "Премиум"
-        premium_line = f"Статус: 💎 Премиум активен ({plan}), до {info['until'].strftime('%d.%m.%Y')}."
+    # гарантируем, что триал создан для новых пользователей
+    await ensure_trial(user_id)
+
+    now = now_ts()
+
+    # забираем конец триала из users
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COALESCE(trial_end_ts,0) FROM users WHERE user_id=?",
+            (user_id,)
+        )
+        row = await cur.fetchone()
+    trial_end = int(row[0]) if row and row[0] else 0
+
+    # конец премиума (TEXT → ts) и план (month/week/None)
+    premium_until = await get_premium_until_ts(user_id)
+    plan = ""
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT plan FROM premium WHERE user_id=?", (user_id,))
+        r = await cur.fetchone()
+        plan = (r[0] or "") if r else ""
+
+    # статусный текст
+    if now <= premium_until:
+        until_str = datetime.fromtimestamp(premium_until).strftime("%d.%m.%Y")
+        plan_name = ("Месячная" if plan.lower() == "month"
+                     else "Недельная" if plan.lower() == "week"
+                     else "Премиум")
+        text = f"💎 Подписка активна ({plan_name}) до {until_str}."
+    elif now <= trial_end:
+        left = days_left(now, trial_end)
+        text = f"Бесплатный период активен. Осталось дней: {left}."
     else:
-        premium_line = "Статус: Премиума нет."
+        text = "Доступ приостановлен. Выберите тариф, чтобы продолжить общение."
 
-    # Бесплатный период
-    created = await get_user_created_at(m.from_user.id)
-    if created:
-        days_used = (datetime.now().date() - created.date()).days
-        days_left = max(FREE_TRIAL_DAYS - days_used, 0)
-    else:
-        days_used = 0
-        days_left = FREE_TRIAL_DAYS
-
-    trial_line = f"Бесплатный период: {FREE_TRIAL_DAYS} дней, осталось: {days_left}."
-
-    # Текущий доступ по дням (если есть премиум — это понятнее отдельной строкой)
-    await m.answer(
-        f"{premium_line}\n{trial_line}\n\n"
-        "Выбери действие ниже:",
-        reply_markup=subscription_panel_main()
-    )
+    # кнопки
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Оформить неделю (300 ₽)", callback_data="sub:week")],
+        [InlineKeyboardButton(text="Оформить месяц (1000 ₽)", callback_data="sub:month")],
+        [InlineKeyboardButton(text="Посмотреть тарифы", callback_data="sub:plans")],
+    ])
+    await m.answer(text + "\n\nВыбери действие ниже:", reply_markup=kb)
 
 @dp.message(F.text == "🔄 Сбросить диалог")
 async def menu_reset(m: Message):
@@ -491,6 +693,64 @@ async def menu_reset(m: Message):
 @dp.message(F.text == "❌ Забыть всё")
 async def menu_forget(m: Message):
     await cmd_forget(m)
+
+@dp.message(F.text == "📝 Обратная связь")
+async def feedback_entry(m: Message, state: FSMContext):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Оставить отзыв", callback_data="fb:review")],
+        [InlineKeyboardButton(text="Пожаловаться",   callback_data="fb:complaint")],
+    ])
+    await state.set_state(Feedback.waiting_kind)
+    await m.answer("Выберите тип сообщения:", reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("fb:"))
+async def feedback_choose(call: CallbackQuery, state: FSMContext):
+    kind = call.data.split(":")[1]  # 'review' или 'complaint'
+    await state.update_data(kind=kind)
+    await state.set_state(Feedback.waiting_text)
+    await call.message.edit_text(
+        "Опишите, пожалуйста, суть.\n"
+        "• Что понравилось / что не так?\n"
+        "• Если есть, добавьте пример.\n\n"
+        "Напишите текст одним сообщением."
+    )
+    await call.answer()
+
+@dp.message(Feedback.waiting_text, F.text)
+async def feedback_save(m: Message, state: FSMContext):
+    data = await state.get_data()
+    kind = data.get("kind", "review")  # 'review' | 'complaint'
+    text = m.text.strip()
+    if not text:
+        return await m.answer("Пожалуйста, опишите ситуацию текстом одним сообщением.")
+
+    now = now_ts()
+
+    # 1) сохранить в БД (таблица feedback уже создана в init_db)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT INTO feedback(user_id, kind, text, created_at) VALUES(?,?,?,?)",
+            (m.from_user.id, kind, text, now)
+        )
+        await db.commit()
+
+    # 2) уведомить админа (если ADMIN_ID задан и ты писал боту ранее)
+    if ADMIN_ID:
+        uname = ("@" + m.from_user.username) if m.from_user.username else "без username"
+        kind_ru = "отзыв" if kind == "review" else "жалоба"
+        try:
+            await bot.send_message(
+                ADMIN_ID,
+                f"Новая {kind_ru}\n"
+                f"От: {uname} (id {m.from_user.id})\n"
+                f"Текст: {text}"
+            )
+        except Exception:
+            # например, 403 если админ не писал боту — тогда просто пропускаем
+            pass
+
+    await state.clear()
+    await m.answer("Спасибо! Я всё записала и передала. Это поможет стать лучше 💜", reply_markup=main_menu())
 
 # ========= INLINE EDIT CALLBACKS (без слэш-команд) =========
 @dp.callback_query(F.data == "edit_name")
@@ -606,19 +866,43 @@ async def on_success_payment(m: Message):
         )
     else:
         await m.answer("Оплата получена. Если это был премиум — он скоро активируется.", reply_markup=main_menu())
+@dp.callback_query(F.data == "sub:plans")
+async def cb_sub_plans(call: CallbackQuery):
+    kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="Оформить неделю (300 ₽)", callback_data="sub:week")],
+        [InlineKeyboardButton(text="Оформить месяц (1000 ₽)", callback_data="sub:month")],
+    ])
+    await call.message.edit_text(
+        "Доступные тарифы:\n• Неделя — 300 ₽\n• Месяц — 1000 ₽\n\nВыберите вариант:",
+        reply_markup=kb
+    )
+    await call.answer()
+
+@dp.callback_query(F.data == "sub:week")
+async def cb_sub_week(call: CallbackQuery):
+    # ТЕСТОВОЕ начисление премиума на 7 дней (без реальной оплаты)
+    until = await grant_premium_days(call.from_user.id, 7, "week")
+    until_str = datetime.fromtimestamp(until).strftime("%d.%m.%Y")
+    await call.message.edit_text(f"💎 Неделя оформлена. Премиум активен до {until_str}.")
+    await call.answer("Премиум продлён на 7 дней")
+
+@dp.callback_query(F.data == "sub:month")
+async def cb_sub_month(call: CallbackQuery):
+    # ТЕСТОВОЕ начисление премиума на 30 дней (без реальной оплаты)
+    until = await grant_premium_days(call.from_user.id, 30, "month")
+    until_str = datetime.fromtimestamp(until).strftime("%d.%m.%Y")
+    await call.message.edit_text(f"💎 Месяц оформлен. Премиум активен до {until_str}.")
+    await call.answer("Премиум продлён на 30 дней")
 
 # ========= TEXT MESSAGE =========
 @dp.message(F.text)
-async def on_text(m: Message):
-    await ensure_user(m.from_user.id)
-
+async def on_text(m: Message, state: FSMContext):
+    user_id = m.from_user.id
     user_text = (m.text or "").strip()
     if not user_text:
         return await m.answer("Напиши текстом, пожалуйста 🙂", reply_markup=main_menu())
 
-    user_id = m.from_user.id
-
-    # 1) Если ждём ответ для редактирования профиля — обрабатываем и выходим (не считаем в лимит)
+    # 0) если ждём ответ для редактирования профиля — обработать и выйти (всегда разрешено)
     if user_id in PENDING_EDIT:
         field = PENDING_EDIT.pop(user_id)
         if field == "name":
@@ -642,20 +926,26 @@ async def on_text(m: Message):
             await set_profile(user_id, interests=interests)
             return await m.answer("Интересы обновила 💜", reply_markup=main_menu())
 
-    # 2) Пассивное извлечение профиля из обычной речи (опционально)
+    # 1) гарантируем пользователя и триал
+    await ensure_trial(user_id)
+
+    # 2) пэйвол (если триал закончился и премиума нет)
+    if not await is_access_allowed(user_id):
+        kb = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="Оформить неделю (300 ₽)", callback_data="sub:week")],
+            [InlineKeyboardButton(text="Оформить месяц (1000 ₽)", callback_data="sub:month")],
+            [InlineKeyboardButton(text="Посмотреть тарифы", callback_data="sub:plans")],
+        ])
+        return await m.answer(
+            "Доступ к переписке приостановлен: бесплатный период завершён.\n"
+            "Выберите тариф, чтобы продолжить общение.",
+            reply_markup=kb
+        )
+
+    # 3) Пассивно дополняем профиль из обычной речи (не мешает диалогу)
     await try_extract_and_save_profile(user_id, user_text)
 
-    # 3) Лимит (если нет премиума)
-    if not await has_premium(user_id):
-        used = await get_count(user_id)
-        if used >= DAILY_FREE_LIMIT:
-            return await m.answer(
-                "Похоже, бесплатный лимит сообщений на сегодня исчерпан 💜\n\n"
-                "Чтобы продолжить без ограничений — открой раздел «💎 Подписка» или нажми ниже:",
-                reply_markup=buy_keyboard()
-            )
-
-    # 4) Контекст: system + профиль + краткая история + текущее сообщение
+    # 4) Готовим контекст для модели
     profile = await get_profile(user_id)
     profile_text = profile_to_text(profile)
     history_rows = await get_history_messages(user_id)
@@ -671,6 +961,7 @@ async def on_text(m: Message):
     except Exception:
         pass
 
+    # 5) Вызов модели
     try:
         reply = await ask_deepseek(messages)
     except httpx.HTTPStatusError as e:
@@ -680,19 +971,12 @@ async def on_text(m: Message):
         logging.exception("DeepSeek error: %s", e)
         return await m.answer("У меня затык. Давай попробуем ещё раз через минуту.", reply_markup=main_menu())
 
+    # 6) Ответ пользователю
     await m.answer(reply, reply_markup=main_menu())
 
-    # 5) Сохраняем диалог
+    # 7) История диалога
     await add_dialog(user_id, "user", user_text)
     await add_dialog(user_id, "assistant", reply)
-
-    # 6) Инкремент лимита, если нет премиума
-    if not await has_premium(user_id):
-        used = await get_count(user_id)
-        await inc_count(user_id, 1)
-        remaining = DAILY_FREE_LIMIT - (used + 1)
-        if remaining in (2, 1):
-            await m.answer(f"Осталось бесплатных сообщений: {remaining}")
 
 # ========= RUN =========
 async def main():
